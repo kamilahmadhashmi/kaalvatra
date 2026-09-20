@@ -26,7 +26,7 @@ import {
 } from 'lucide-react';
 
 export function App() {
-  const [theme, setTheme] = useState<Theme>('midnight');
+  const [theme, setTheme] = useState<Theme>('newsprint');
   const initialRoute = useMemo(() => parseCurrentRoute(), []);
   const [currentView, setCurrentView] = useState<'frontpage' | 'atlas' | 'pipeline'>(initialRoute.view);
   const [language, setLanguage] = useState<SupportedLanguage>('en');

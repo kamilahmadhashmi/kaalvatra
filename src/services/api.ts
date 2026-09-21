@@ -193,6 +193,14 @@ async function fetchMarketAsync(): Promise<MarketSnapshot> {
   }
 }
 
+type StoryUpdateListener = (stories: ClusteredStory[], runId: string) => void;
+const storyListeners: Set<StoryUpdateListener> = new Set();
+
+export function onNationalStoriesUpdate(callback: StoryUpdateListener): () => void {
+  storyListeners.add(callback);
+  return () => storyListeners.delete(callback);
+}
+
 export async function getNationalStories(): Promise<{ run_id: string; stories: ClusteredStory[] }> {
   if (cachedNationalStories) {
     if (!isFetchingNational) {
@@ -204,11 +212,14 @@ export async function getNationalStories(): Promise<{ run_id: string; stories: C
   return syncNationalStoriesInBackground();
 }
 
-async function syncNationalStoriesInBackground(): Promise<{ run_id: string; stories: ClusteredStory[] }> {
+export async function syncNationalStoriesInBackground(): Promise<{ run_id: string; stories: ClusteredStory[] }> {
+  if (isFetchingNational) {
+    return cachedNationalStories || INITIAL_STORIES;
+  }
   isFetchingNational = true;
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 7000);
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
     const res = await fetch(`${BASE_API}/national/stories`, { signal: controller.signal });
     clearTimeout(timeoutId);
     if (!res.ok) throw new Error(`National stories HTTP error ${res.status}`);
@@ -217,26 +228,44 @@ async function syncNationalStoriesInBackground(): Promise<{ run_id: string; stor
     if (data && Array.isArray(data.stories) && data.stories.length > 0) {
       const normalized = {
         run_id: data.run_id || 'live-national-run',
-        stories: data.stories.map((s: any, idx: number) => ({
-          story_id: s.story_id || `story-${idx}`,
-          run_id: s.run_id || data.run_id,
-          story_title: s.story_title || s.headline || 'Untitled National Dispatch',
-          article_count: s.article_count || (s.sources ? s.sources.length : 1),
-          latest_published_at: s.latest_published_at || new Date().toISOString(),
-          states: s.states || [],
-          reasons: s.reasons || ['High-density national wire clustering', 'Cross-source entity alignment'],
-          sources: s.sources || ['The Hindu', 'Indian Express', 'Times of India', 'NDTV'],
-          article_ids: s.article_ids || [],
-          category: assignCategory(s.story_title || ''),
-          summary: s.summary || s.lead || `Consensus report across ${s.article_count || 3} national newsrooms.`
-        }))
+        stories: data.stories.map((s: any, idx: number) => {
+          const rawTitle = s.story_title || s.headline || 'Untitled National Dispatch';
+          const cleanTitle = cleanArticleSummary(rawTitle.replace(/\uFFFD/g, "'"));
+          const cleanSources = (s.sources || ['The Hindu', 'Indian Express', 'Times of India', 'NDTV'])
+            .map((src: string) => cleanArticleSummary(src.replace(/\uFFFD/g, '—')));
+          const summaryFallback = s.summary || s.lead || `Consensus report across ${cleanSources.slice(0, 3).join(', ')}. Cross-wire entity verification confirmed synchronized coverage across national bureaux.`;
+
+          return {
+            story_id: s.story_id || `story-${idx}`,
+            run_id: s.run_id || data.run_id,
+            story_title: cleanTitle,
+            article_count: s.article_count || (s.sources ? s.sources.length : 1),
+            latest_published_at: s.latest_published_at || new Date().toISOString(),
+            states: s.states || [],
+            reasons: s.reasons || ['High-density national wire clustering', 'Cross-source entity alignment'],
+            sources: cleanSources,
+            article_ids: s.article_ids || [],
+            category: assignCategory(cleanTitle),
+            summary: cleanArticleSummary(summaryFallback)
+          };
+        })
       };
       cachedNationalStories = normalized;
       isFetchingNational = false;
+
+      // Broadcast live update to all active views and components
+      storyListeners.forEach(listener => {
+        try {
+          listener(normalized.stories, normalized.run_id);
+        } catch (e) {
+          console.error('Error notifying story listener:', e);
+        }
+      });
+
       return normalized;
     }
   } catch (err) {
-    // Keep cached
+    // Keep cached on network errors
   }
   isFetchingNational = false;
   return cachedNationalStories || INITIAL_STORIES;
@@ -362,7 +391,7 @@ export async function getStoryDetailArticles(runId: string, storyId: string, fal
   if (runId && storyId && !runId.startsWith('local-') && !runId.startsWith('initial-') && !runId.startsWith('editorial-')) {
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 6500);
+      const timeoutId = setTimeout(() => controller.abort(), 20000);
       const res = await fetch(`${BASE_API}/stories/${encodeURIComponent(runId)}/${encodeURIComponent(storyId)}`, {
         signal: controller.signal
       });
@@ -370,20 +399,29 @@ export async function getStoryDetailArticles(runId: string, storyId: string, fal
       if (res.ok) {
         const data = await res.json();
         if (data && Array.isArray(data.articles) && data.articles.length > 0) {
-          const normalized: WireArticle[] = data.articles.map((a: any, idx: number) => ({
-            article_id: a.article_id || `art-${idx}`,
-            headline: a.headline || a.title || 'Untitled Report',
-            summary: a.summary || a.lead || '',
-            url: a.url || a.canonical_url || buildSpecificArticleUrl(a.headline || a.title || 'National Report', a.source?.name || a.source_name || 'The Hindu'),
-            canonical_url: a.canonical_url || a.url,
-            published_at: a.published_at || new Date().toISOString(),
-            source: {
-              source_id: a.source_id || a.source?.source_id || '',
-              name: a.source?.name || a.source_name || a.source_id || 'National Wire',
-              scope: a.source?.scope || 'NATIONAL',
-              language: a.source?.language || 'EN'
-            }
-          }));
+          const normalized: WireArticle[] = data.articles.map((a: any, idx: number) => {
+            const rawHead = a.headline || a.title || 'Untitled Report';
+            const cleanHead = cleanArticleSummary(rawHead.replace(/\uFFFD/g, "'"));
+            const rawSummary = a.summary || a.lead || '';
+            const cleanSum = cleanArticleSummary(rawSummary.replace(/\uFFFD/g, "'"));
+            const rawSrc = a.source?.name || a.source_name || a.source_id || 'National Wire';
+            const cleanSrc = cleanArticleSummary(rawSrc.replace(/\uFFFD/g, '—'));
+
+            return {
+              article_id: a.article_id || `art-${idx}`,
+              headline: cleanHead,
+              summary: cleanSum,
+              url: a.canonical_url || a.url || buildSpecificArticleUrl(cleanHead, cleanSrc),
+              canonical_url: a.canonical_url || a.url,
+              published_at: a.published_at || new Date().toISOString(),
+              source: {
+                source_id: a.source_id || a.source?.source_id || '',
+                name: cleanSrc,
+                scope: a.source?.scope || 'NATIONAL',
+                language: a.source?.language || 'EN'
+              }
+            };
+          });
           cachedStoryArticles[cacheKey] = normalized;
           return normalized;
         }

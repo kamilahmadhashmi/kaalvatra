@@ -14,7 +14,7 @@ import { SearchModal } from './components/SearchModal';
 import { StateSwitcherModal } from './components/StateSwitcherModal';
 import { CurtainTransition } from './components/CurtainTransition';
 import { STATES_DATA, ALL_STATE_IDS } from './data/statesData';
-import { getNationalStories, getMarketData, findStoryById } from './services/api';
+import { getNationalStories, getMarketData, findStoryById, onNationalStoriesUpdate, syncNationalStoriesInBackground } from './services/api';
 import { downloadMorningDigest } from './utils/exportDigest';
 import { resolveCanonicalStateId, parseCurrentRoute, syncRouteToUrl } from './utils/stateUtils';
 import type { Theme, ClusteredStory, MarketSnapshot, SupportedLanguage } from './types';
@@ -200,10 +200,26 @@ export function App() {
 
   useEffect(() => {
     let mounted = true;
+
+    // 1. Initial load (cached or fallback)
     getNationalStories().then((res) => {
-      if (mounted) setNationalStories(res.stories);
+      if (mounted && res && res.stories) setNationalStories(res.stories);
     });
 
+    // 2. Subscribe to live pipeline updates from the AWS backend
+    const unsubscribeStories = onNationalStoriesUpdate((stories) => {
+      if (mounted && stories && stories.length > 0) {
+        setNationalStories(stories);
+      }
+    });
+
+    // 3. Periodic poll for new pipeline runs every 60s
+    const pollStories = async () => {
+      await syncNationalStoriesInBackground();
+    };
+    const storiesInterval = setInterval(pollStories, 60000);
+
+    // 4. Live market telemetry polling every 30s
     const pollMarket = async () => {
       const data = await getMarketData();
       if (mounted) {
@@ -215,10 +231,13 @@ export function App() {
     };
 
     pollMarket();
-    const interval = setInterval(pollMarket, 30000); // 30s persistent live market telemetry polling
+    const marketInterval = setInterval(pollMarket, 30000);
+
     return () => {
       mounted = false;
-      clearInterval(interval);
+      unsubscribeStories();
+      clearInterval(marketInterval);
+      clearInterval(storiesInterval);
     };
   }, []);
 
